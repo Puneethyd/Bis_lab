@@ -1,1 +1,257 @@
+"""
+Ant Colony Optimization (ACO) for Resource Allocation in a Cloud Computing Environment
+-----------------------------------------------------------------------------------------
+Problem : map N independent tasks (cloudlets) to M heterogeneous virtual machines (VMs)
+Goals   : minimise makespan, execution cost and load imbalance (weighted objective)
+Compare : ACO  vs  Random  vs  Round-Robin  vs  Greedy-MCT  vs  Min-Min
+Runs in : Google Colab / Jupyter / plain Python (needs only numpy + matplotlib)
 
+Just paste into one Colab cell and run.
+"""
+import os
+import numpy as np
+try:                                    # Colab / Jupyter -> show plots inline
+    from IPython import get_ipython
+    if get_ipython() is not None and os.environ.get("ACO_NO_GUI") != "1":
+        get_ipython().run_line_magic("matplotlib", "inline")
+except Exception:
+    pass
+import matplotlib
+if os.environ.get("ACO_NO_GUI") == "1":
+    matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+# ============================================================================
+# 1. CLOUD MODEL
+# ============================================================================
+def make_environment(n_tasks, n_vms, seed=1):
+    """Random heterogeneous cloud: task lengths (MI), VM speed (MIPS), VM price ($/s)."""
+    r = np.random.default_rng(seed)
+    length = r.integers(1000, 20000, n_tasks).astype(float)        # million instructions
+    mips = r.choice([500, 750, 1000, 1500, 2000, 2500, 3000], n_vms).astype(float)
+    price = 0.002 * (mips / 1000.0) ** 0.8 + 0.0005                # faster VM = costlier
+    etc = length[:, None] / mips[None, :]                          # expected time to compute (s)
+    return dict(length=length, mips=mips, price=price, etc=etc, N=n_tasks, M=n_vms)
+
+
+def evaluate(assign, env):
+    """Return makespan, cost, imbalance degree, utilisation for a task->VM assignment."""
+    N, M, etc, price = env["N"], env["M"], env["etc"], env["price"]
+    vm_time = np.zeros(M)
+    np.add.at(vm_time, assign, etc[np.arange(N), assign])
+    makespan = vm_time.max()
+    cost = float((vm_time * price).sum())
+    imbalance = (vm_time.max() - vm_time.min()) / max(vm_time.mean(), 1e-9)
+    utilisation = vm_time.mean() / makespan
+    return dict(makespan=makespan, cost=cost, imbalance=imbalance,
+                utilisation=utilisation, vm_time=vm_time)
+
+
+# ============================================================================
+# 2. BASELINE SCHEDULERS
+# ============================================================================
+def random_alloc(env, rng):
+    return rng.integers(0, env["M"], env["N"])
+
+def round_robin(env, rng=None):
+    return np.arange(env["N"]) % env["M"]
+
+def greedy_mct(env, rng=None):
+    """Minimum Completion Time: each task (in arrival order) goes to the VM that finishes it first."""
+    ready = np.zeros(env["M"]); a = np.zeros(env["N"], int)
+    for t in range(env["N"]):
+        j = np.argmin(ready + env["etc"][t]); a[t] = j; ready[j] += env["etc"][t, j]
+    return a
+
+def min_min(env, rng=None):
+    N, M, etc = env["N"], env["M"], env["etc"]
+    ready = np.zeros(M); a = np.zeros(N, int); left = list(range(N))
+    while left:
+        ct = ready[None, :] + etc[left]                 # completion times
+        jbest = ct.argmin(1); cbest = ct.min(1)
+        k = int(cbest.argmin()); t = left.pop(k); j = jbest[k]
+        a[t] = j; ready[j] += etc[t, j]
+    return a
+
+
+# ============================================================================
+# 3. ANT COLONY OPTIMISATION
+# ============================================================================
+def aco(env, n_ants=30, n_iter=100, alpha=1.0, beta=2.0, rho=0.1, Q=1.0,
+        w=(0.6, 0.2, 0.2), seed=0, return_pheromone=False):
+    """
+    Ants build a complete task->VM mapping task by task.
+    Choice probability  p(t,j) ∝ τ[t,j]^α · η(t,j)^β
+    where η(t,j) = 1 / (current finish time of VM j + ETC[t,j])  (load-aware heuristic).
+    Pheromone update    τ ← (1-ρ)τ + Σ Δτ ; only the iteration-best and global-best ants deposit
+    (elitist, bounded like MAX-MIN Ant System to avoid early stagnation).
+    Objective (minimise): w1·makespan/ms0 + w2·cost/cost0 + w3·imbalance
+    """
+    rng = np.random.default_rng(seed)
+    N, M, etc, price = env["N"], env["M"], env["etc"], env["price"]
+    ref = evaluate(round_robin(env), env)                    # normalisation reference
+    ms0, c0 = ref["makespan"], ref["cost"]
+
+    def fitness(a):
+        e = evaluate(a, env)
+        return w[0] * e["makespan"] / ms0 + w[1] * e["cost"] / c0 + w[2] * e["imbalance"], e
+
+    tau = np.ones((N, M))
+    tau_max = 1.0; tau_min = 0.01
+    best_f, best_a, best_e = np.inf, None, None
+    history = []
+
+    for it in range(n_iter):
+        assigns = np.zeros((n_ants, N), int)
+        ready = np.zeros((n_ants, M))
+        order = rng.permutation(N)                           # random task order each iteration
+        for t in order:
+            eta = 1.0 / (ready + etc[t][None, :])            # (ants, M)
+            p = (tau[t][None, :] ** alpha) * (eta ** beta)
+            p /= p.sum(1, keepdims=True)
+            cum = p.cumsum(1)
+            j = (rng.random((n_ants, 1)) > cum).sum(1)       # roulette-wheel selection
+            j = np.minimum(j, M - 1)
+            assigns[:, t] = j
+            ready[np.arange(n_ants), j] += etc[t, j]
+
+        fits = np.array([fitness(a)[0] for a in assigns])
+        ib = fits.argmin()
+        if fits[ib] < best_f:
+            best_f, best_a = fits[ib], assigns[ib].copy()
+            best_e = evaluate(best_a, env)
+
+        # --- pheromone update: evaporation + elitist deposit ---
+        tau *= (1 - rho)
+        for a, f, weight in ((assigns[ib], fits[ib], 1.0), (best_a, best_f, 1.0)):
+            tau[np.arange(N), a] += weight * Q / f * 0.1
+        tau = np.clip(tau, tau_min, tau_max * 10)
+        history.append(best_e["makespan"])
+
+    out = (best_a, np.array(history))
+    return out + (tau,) if return_pheromone else out
+
+
+# ============================================================================
+# 4. EXPERIMENTS
+# ============================================================================
+def run_all():
+    N, M = 100, 10
+    env = make_environment(N, M, seed=1)
+    rng = np.random.default_rng(5)
+
+    # ---- (A) main comparison ------------------------------------------------
+    results = {}
+    results["Random"] = evaluate(random_alloc(env, rng), env)
+    results["Round-Robin"] = evaluate(round_robin(env), env)
+    results["Greedy-MCT"] = evaluate(greedy_mct(env), env)
+    results["Min-Min"] = evaluate(min_min(env), env)
+    a_aco, hist, tau = aco(env, return_pheromone=True)
+    results["ACO"] = evaluate(a_aco, env)
+
+    print("\n=== MAIN COMPARISON : %d tasks on %d heterogeneous VMs ===" % (N, M))
+    print(f"{'Algorithm':<13}{'Makespan(s)':>13}{'Cost($)':>11}{'Imbalance':>11}{'Utilisation':>13}")
+    for k, v in results.items():
+        print(f"{k:<13}{v['makespan']:>13.3f}{v['cost']:>11.3f}{v['imbalance']:>11.3f}{v['utilisation']:>13.3f}")
+    base = results["Round-Robin"]["makespan"]
+    print("\nACO makespan improvement vs Round-Robin : %.1f %%" %
+          (100 * (base - results['ACO']['makespan']) / base))
+
+    # ---- (B) scalability ----------------------------------------------------
+    sizes = [50, 100, 150, 200, 300]
+    scal = {k: [] for k in ["Random", "Round-Robin", "Greedy-MCT", "Min-Min", "ACO"]}
+    for n in sizes:
+        e = make_environment(n, M, seed=n)
+        scal["Random"].append(evaluate(random_alloc(e, rng), e)["makespan"])
+        scal["Round-Robin"].append(evaluate(round_robin(e), e)["makespan"])
+        scal["Greedy-MCT"].append(evaluate(greedy_mct(e), e)["makespan"])
+        scal["Min-Min"].append(evaluate(min_min(e), e)["makespan"])
+        scal["ACO"].append(evaluate(aco(e, n_iter=100)[0], e)["makespan"])
+
+    # ---- (C) parameter sensitivity -----------------------------------------
+    rhos = [0.05, 0.1, 0.2, 0.4, 0.6]
+    betas = [0.5, 1, 2, 3, 5]
+    sens_rho = [np.mean([evaluate(aco(env, rho=r, n_iter=60, seed=s)[0], env)["makespan"]
+                         for s in range(3)]) for r in rhos]
+    sens_beta = [np.mean([evaluate(aco(env, beta=b, n_iter=60, seed=s)[0], env)["makespan"]
+                          for s in range(3)]) for b in betas]
+
+    # ---- (D) ant-count effect ----------------------------------------------
+    ants_list = [5, 10, 20, 40, 80]
+    sens_ants = [np.mean([evaluate(aco(env, n_ants=k, n_iter=60, seed=s)[0], env)["makespan"]
+                          for s in range(3)]) for k in ants_list]
+
+    # ========================================================================
+    # 5. PLOTS
+    # ========================================================================
+    names = list(results)
+    cols = ["#999999", "#bbbbbb", "#ffb347", "#6fa8dc", "#2e7d32"]
+
+    fig, ax = plt.subplots(1, 2, figsize=(13, 4.5))
+    ax[0].plot(hist, lw=2, color="#2e7d32", label="ACO best-so-far")
+    ax[0].axhline(results["Min-Min"]["makespan"], ls="--", color="#6fa8dc", label="Min-Min")
+    ax[0].axhline(results["Round-Robin"]["makespan"], ls="--", color="gray", label="Round-Robin")
+    ax[0].set_xlabel("Iteration"); ax[0].set_ylabel("Makespan (s)")
+    ax[0].set_title("Fig 1a. ACO convergence"); ax[0].grid(alpha=.3); ax[0].legend()
+    for m, lab in (("makespan", "Makespan (s)"),):
+        bars = ax[1].bar(names, [results[k][m] for k in names], color=cols)
+        for b_ in bars:
+            ax[1].text(b_.get_x() + b_.get_width() / 2, b_.get_height(), f"{b_.get_height():.1f}",
+                       ha="center", va="bottom", fontsize=8)
+        ax[1].set_ylabel(lab); ax[1].set_title("Fig 1b. Makespan comparison")
+        ax[1].grid(alpha=.3, axis="y")
+    plt.setp(ax[1].get_xticklabels(), rotation=15)
+    fig.tight_layout(); fig.savefig("aco_fig1_convergence_makespan.png", dpi=150); plt.show()
+
+    fig, ax = plt.subplots(1, 3, figsize=(15, 4.5))
+    ax[0].bar(names, [results[k]["cost"] for k in names], color=cols); ax[0].set_title("Fig 2a. Execution cost ($)")
+    ax[1].bar(names, [results[k]["imbalance"] for k in names], color=cols); ax[1].set_title("Fig 2b. Load-imbalance degree (lower = better)")
+    ax[2].bar(names, [results[k]["utilisation"] * 100 for k in names], color=cols); ax[2].set_title("Fig 2c. Resource utilisation (%)")
+    for x in ax:
+        x.grid(alpha=.3, axis="y"); plt.setp(x.get_xticklabels(), rotation=20)
+    fig.tight_layout(); fig.savefig("aco_fig2_cost_balance_utilisation.png", dpi=150); plt.show()
+
+    fig, ax = plt.subplots(1, 2, figsize=(14, 4.8))
+    xx = np.arange(M); w_ = 0.27
+    for i, k in enumerate(["Round-Robin", "Min-Min", "ACO"]):
+        ax[0].bar(xx + (i - 1) * w_, results[k]["vm_time"], w_, label=k, color=["#bbbbbb", "#6fa8dc", "#2e7d32"][i])
+    ax[0].set_xticks(xx); ax[0].set_xticklabels([f"VM{j+1}\n{int(env['mips'][j])}" for j in xx], fontsize=8)
+    ax[0].set_ylabel("Busy time (s)"); ax[0].set_title("Fig 3a. Load on each VM (label: MIPS)")
+    ax[0].legend(); ax[0].grid(alpha=.3, axis="y")
+    im = ax[1].imshow(tau[:40].T, aspect="auto", cmap="YlOrRd")
+    ax[1].set_xlabel("Task (first 40)"); ax[1].set_ylabel("VM"); ax[1].set_title("Fig 3b. Final pheromone matrix τ")
+    fig.colorbar(im, ax=ax[1], label="pheromone")
+    fig.tight_layout(); fig.savefig("aco_fig3_vm_load_pheromone.png", dpi=150); plt.show()
+
+    fig, ax = plt.subplots(1, 2, figsize=(13, 4.5))
+    for k, c_ in zip(scal, cols):
+        ax[0].plot(sizes, scal[k], "o-", label=k, color=c_, lw=2)
+    ax[0].set_xlabel("Number of tasks"); ax[0].set_ylabel("Makespan (s)")
+    ax[0].set_title("Fig 4a. Scalability with workload"); ax[0].legend(); ax[0].grid(alpha=.3)
+    ax[1].plot(sizes, [100 * (scal["Round-Robin"][i] - scal["ACO"][i]) / scal["Round-Robin"][i]
+                       for i in range(len(sizes))], "s-", color="#2e7d32", lw=2)
+    ax[1].set_xlabel("Number of tasks"); ax[1].set_ylabel("Improvement over Round-Robin (%)")
+    ax[1].set_title("Fig 4b. ACO makespan reduction"); ax[1].grid(alpha=.3)
+    fig.tight_layout(); fig.savefig("aco_fig4_scalability.png", dpi=150); plt.show()
+
+    fig, ax = plt.subplots(1, 3, figsize=(15, 4.2))
+    ax[0].plot(rhos, sens_rho, "o-", color="#2e7d32"); ax[0].set_xlabel("Evaporation rate ρ"); ax[0].set_title("Fig 5a. Effect of ρ")
+    ax[1].plot(betas, sens_beta, "o-", color="#2e7d32"); ax[1].set_xlabel("Heuristic weight β"); ax[1].set_title("Fig 5b. Effect of β")
+    ax[2].plot(ants_list, sens_ants, "o-", color="#2e7d32"); ax[2].set_xlabel("Number of ants"); ax[2].set_title("Fig 5c. Effect of colony size")
+    for x in ax:
+        x.set_ylabel("Mean makespan (s)"); x.grid(alpha=.3)
+    fig.tight_layout(); fig.savefig("aco_fig5_parameter_sensitivity.png", dpi=150); plt.show()
+
+    print("\n=== SCALABILITY (makespan, s) ===")
+    print("Tasks      " + "".join(f"{s:>9}" for s in sizes))
+    for k in scal:
+        print(f"{k:<11}" + "".join(f"{v:>9.1f}" for v in scal[k]))
+    print("\n=== PARAMETER SENSITIVITY (mean makespan, s) ===")
+    print("rho  :", dict(zip(rhos, [round(float(v),2) for v in sens_rho])))
+    print("beta :", dict(zip(betas, [round(float(v),2) for v in sens_beta])))
+    print("ants :", dict(zip(ants_list, [round(float(v),2) for v in sens_ants])))
+    print("\nSaved 5 PNG figures: aco_fig1 ... aco_fig5")
+
+
+if __name__ == "__main__":
+    run_all()
