@@ -1,0 +1,296 @@
+"""
+Cost-Effective (Economic Load) Dispatch using Grey Wolf Optimizer (GWO)
+Based on: Kadali et al., "Cost-Effective Dispatch Using Grey Wolf Optimization
+Algorithm: Solution with Diverse Load Pattern", IEEE ICSCAN 2020.
+
+Test system : 10-unit thermal system (standard data from Basu / Al-Betar et al.)
+Cases       : (A) Static dispatch, 2000 MW, quadratic + valve-point (non-convex) cost
+              (B) Dynamic dispatch, 24 intervals, with ramp-rate limits
+Outputs     : console tables + PNG figures saved next to this script
+"""
+import numpy as np
+import os
+import matplotlib
+# Use a non-interactive backend only if there is no display (e.g. server/sandbox)
+if os.environ.get("GWO_NO_GUI") == "1":
+    matplotlib.use("Agg")
+# In Colab / Jupyter, force inline plotting (also undoes a stale 'Agg' backend)
+try:
+    from IPython import get_ipython
+    _ip = get_ipython()
+    if _ip is not None and os.environ.get("GWO_NO_GUI") != "1":
+        _ip.run_line_magic("matplotlib", "inline")
+except Exception:
+    pass
+import matplotlib.pyplot as plt
+
+rng = np.random.default_rng(7)
+
+# ----------------------------------------------------------------------------
+# 1. SYSTEM DATA  (10 units)  f = a*P^2 + b*P + c + |d*sin(e*(Pmin-P))|
+# ----------------------------------------------------------------------------
+Pmin = np.array([10, 20, 47, 20, 50, 70, 60, 70, 135, 150], float)
+Pmax = np.array([55, 80, 120, 130, 160, 240, 300, 340, 470, 470], float)
+a = np.array([0.12951, 0.10908, 0.12511, 0.12111, 0.15247,
+              0.10587, 0.03546, 0.02803, 0.02111, 0.01799])
+b = np.array([40.5407, 39.5804, 36.5104, 39.5104, 38.5390,
+              46.1592, 38.3055, 40.3965, 36.3278, 38.2704])
+c = np.array([1000.403, 950.606, 900.705, 800.705, 756.799,
+              451.325, 1243.531, 1049.998, 1658.569, 1356.659])
+d = np.array([33, 25, 32, 30, 30, 20, 20, 30, 60, 40], float)
+e = np.array([0.0174, 0.0178, 0.0162, 0.0168, 0.0148,
+              0.0163, 0.0152, 0.0128, 0.0136, 0.0141])
+# Ramp limits (MW/h) -- ASSUMED values, the paper does not list them
+UR = DR = np.array([30, 30, 30, 40, 40, 50, 50, 50, 60, 60], float)
+
+# Loss (B) coefficients, scaled by 1e-4 ; B0 and B00 taken as zero
+B = 1e-4 * np.array([
+    [0.49, 0.14, 0.15, 0.15, 0.16, 0.17, 0.17, 0.18, 0.19, 0.20],
+    [0.14, 0.45, 0.16, 0.16, 0.17, 0.15, 0.15, 0.16, 0.18, 0.18],
+    [0.15, 0.16, 0.39, 0.10, 0.12, 0.12, 0.14, 0.14, 0.16, 0.16],
+    [0.15, 0.16, 0.10, 0.40, 0.14, 0.10, 0.11, 0.12, 0.14, 0.15],
+    [0.16, 0.17, 0.12, 0.14, 0.35, 0.11, 0.13, 0.12, 0.16, 0.16],
+    [0.17, 0.15, 0.12, 0.10, 0.11, 0.36, 0.12, 0.10, 0.15, 0.14],
+    [0.17, 0.15, 0.14, 0.11, 0.13, 0.12, 0.38, 0.16, 0.16, 0.18],
+    [0.18, 0.16, 0.14, 0.12, 0.12, 0.10, 0.16, 0.40, 0.15, 0.16],
+    [0.19, 0.18, 0.16, 0.14, 0.16, 0.15, 0.16, 0.15, 0.42, 0.19],
+    [0.20, 0.18, 0.16, 0.15, 0.16, 0.14, 0.18, 0.16, 0.19, 0.44]])
+N = 10
+
+# 24-hour demand profile (MW), commonly used with this system
+DEMAND24 = np.array([1036, 1110, 1258, 1406, 1480, 1628, 1702, 1776, 1924, 2022,
+                     2106, 2150, 2072, 1924, 1776, 1554, 1480, 1628, 1776, 1972,
+                     1924, 1628, 1332, 1184], float)
+
+
+# ----------------------------------------------------------------------------
+# 2. PROBLEM MODEL  (Eqs. 3,4,6)
+# ----------------------------------------------------------------------------
+def fuel_cost(P, valve_point):
+    """P: (..., N) -> total cost ($/h) for each row."""
+    f = a * P**2 + b * P + c
+    if valve_point:
+        f = f + np.abs(d * np.sin(e * (Pmin - P)))
+    return f.sum(axis=-1)
+
+
+def losses(P):
+    """Kron's loss formula P_L = P B P^T  (Eq. 6, B0 = B00 = 0)."""
+    return np.einsum("...i,ij,...j->...", P, B, P)
+
+
+# ----------------------------------------------------------------------------
+# 3. CONSTRAINT HANDLING  (Eq. 18 : solve the slack unit from power balance)
+# ----------------------------------------------------------------------------
+def repair(P, demand, lo, hi, slack=None):
+    """Adjust one slack unit so that sum(P) = demand + loss, then clip."""
+    P = np.clip(P, lo, hi)
+    for _ in range(2):                         # two passes polish clipping effects
+        for k in ([slack] if slack is not None else [N - 1]):
+            others = np.delete(P, k, axis=-1)
+            Bk = np.delete(B[k], k)
+            Bkk = B[k, k]
+            Bo = np.delete(np.delete(B, k, 0), k, 1)
+            S = others.sum(axis=-1)
+            lin = 2 * (others @ Bk)
+            quad_rest = np.einsum("...i,ij,...j->...", others, Bo, others)
+            # Bkk*Pk^2 + (lin-1)*Pk + (quad_rest - S + demand) = 0
+            A_, B_, C_ = Bkk, lin - 1.0, quad_rest - S + demand
+            disc = np.maximum(B_**2 - 4 * A_ * C_, 0.0)
+            Pk = (-B_ - np.sqrt(disc)) / (2 * A_)
+            P[..., k] = np.clip(Pk, lo[k], hi[k])
+    return P
+
+
+def augmented_objective(P, demand, lo, hi, vp, lam=1e4):
+    """Eq. 13 : OF + lambda*|sum(P) - PD - PL|  (penalty for residual mismatch)."""
+    mismatch = np.abs(P.sum(axis=-1) - demand - losses(P))
+    return fuel_cost(P, vp) + lam * mismatch
+
+
+# ----------------------------------------------------------------------------
+# 4. GREY WOLF OPTIMIZER  (Eqs. 10, 15-17)
+# ----------------------------------------------------------------------------
+def gwo(demand, lo, hi, vp, n_wolves=40, iters=500, slack=None):
+    # Step 1: random initial pack (Eq. 10) + repair
+    X = lo + rng.random((n_wolves, N)) * (hi - lo)
+    X = repair(X, demand, lo, hi, slack)
+    fit = augmented_objective(X, demand, lo, hi, vp)
+
+    order = np.argsort(fit)
+    alpha, beta, delta = X[order[0]].copy(), X[order[1]].copy(), X[order[2]].copy()
+    f_alpha = fit[order[0]]
+    history = [fuel_cost(alpha, vp)]
+
+    for t in range(iters):
+        a_par = 2 - 2 * t / iters                   # decreases linearly 2 -> 0
+        Xnew = np.zeros_like(X)
+        for leader in (alpha, beta, delta):         # Eqs. 16-17
+            r1, r2 = rng.random((n_wolves, N)), rng.random((n_wolves, N))
+            A = 2 * a_par * r1 - a_par
+            C = 2 * r2
+            D = np.abs(C * leader - X)
+            Xnew += leader - A * D
+        X = Xnew / 3.0                              # Eq. 15
+        X = repair(X, demand, lo, hi, slack)        # Steps 6-7
+        fit = augmented_objective(X, demand, lo, hi, vp)
+
+        # update leaders (Step 3)
+        order = np.argsort(fit)
+        if fit[order[0]] < f_alpha:
+            f_alpha, alpha = fit[order[0]], X[order[0]].copy()
+        beta, delta = X[order[1]].copy(), X[order[2]].copy()
+        history.append(fuel_cost(alpha, vp))
+    return alpha, np.array(history)
+
+
+# ----------------------------------------------------------------------------
+# 5. CASE A - STATIC DISPATCH
+# ----------------------------------------------------------------------------
+def run_static():
+    results = {}
+    for name, vp in (("Quadratic", False), ("Non-convex (valve point)", True)):
+        best, hist = None, None
+        for _ in range(5):                          # a few independent runs
+            P, h = gwo(2000.0, Pmin, Pmax, vp, iters=500)
+            if best is None or h[-1] < hist[-1]:
+                best, hist = P, h
+        results[name] = dict(P=best, hist=hist, cost=fuel_cost(best, vp),
+                             loss=losses(best), vp=vp)
+    return results
+
+
+# ----------------------------------------------------------------------------
+# 6. CASE B - DYNAMIC DISPATCH (24 h, ramp limits, sequential interval solve)
+# ----------------------------------------------------------------------------
+def run_dynamic(vp):
+    sched, hists, costs, loss_l = [], [], [], []
+    prev = None
+    for k, dem in enumerate(DEMAND24):
+        lo, hi = Pmin.copy(), Pmax.copy()
+        if prev is not None:                        # Eq. 9 / Eq. 20
+            lo = np.maximum(Pmin, prev - DR)
+            hi = np.minimum(Pmax, prev + UR)
+        P, h = gwo(dem, lo, hi, vp, n_wolves=30, iters=100)
+        sched.append(P); hists.append(h)
+        costs.append(fuel_cost(P, vp)); loss_l.append(losses(P))
+        prev = P
+    return np.array(sched), np.array(hists), np.array(costs), np.array(loss_l)
+
+
+# ----------------------------------------------------------------------------
+# 7. REPORTING + PLOTS
+# ----------------------------------------------------------------------------
+def main():
+    # ---------------- static ----------------
+    res = run_static()
+    print("\n=== CASE A : STATIC DISPATCH (Demand = 2000 MW) ===")
+    print(f"{'Unit':<6}" + "".join(f"{k:>28}" for k in res))
+    for i in range(N):
+        print(f"P{i+1:<5}" + "".join(f"{r['P'][i]:>28.4f}" for r in res.values()))
+    print(f"{'Total':<6}" + "".join(f"{r['P'].sum():>28.4f}" for r in res.values()))
+    print(f"{'Loss':<6}" + "".join(f"{r['loss']:>28.4f}" for r in res.values()))
+    print(f"{'Cost':<6}" + "".join(f"{r['cost']:>28.4f}" for r in res.values()))
+
+    # ---------------- dynamic ----------------
+    dyn = {}
+    for name, vp in (("Without valve point", False), ("With valve point", True)):
+        dyn[name] = run_dynamic(vp)
+    print("\n=== CASE B : DYNAMIC DISPATCH (24 h) ===")
+    for name, (S, H, C, L) in dyn.items():
+        print(f"{name:<22} Total fuel cost = {C.sum():>14.2f} $ | "
+              f"Total generation = {S.sum():>10.2f} MW | Total loss = {L.sum():>8.2f} MW")
+
+    # ---------------- literature (from paper Table II) ----------------
+    lit = {"CIHSA": 111497.631, "ABCPSO": 111500.0, "DE": 111500.0,
+           "PHOA": 112130.85}
+    gwo_nc = res["Non-convex (valve point)"]["cost"]
+
+    # ===================== FIGURES =====================
+    colors = plt.cm.tab10(np.arange(N))
+
+    # Fig 1 convergence (static)
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    for name, r in res.items():
+        ax.plot(r["hist"], lw=2, label=name)
+    ax.set_xlabel("Iteration"); ax.set_ylabel("Fuel cost ($/h)")
+    ax.set_title("Fig 1. GWO convergence - static dispatch (TS-I)")
+    ax.set_ylim(min(r["cost"] for r in res.values()) * 0.995,
+                min(r["cost"] for r in res.values()) * 1.04)
+    ax.grid(alpha=.3); ax.legend(); fig.tight_layout()
+    fig.savefig("fig1_static_convergence.png", dpi=150)
+
+    # Fig 2 generation per unit + comparison
+    fig, axs = plt.subplots(1, 2, figsize=(13, 4.8))
+    w = 0.38; x = np.arange(N)
+    for j, (name, r) in enumerate(res.items()):
+        axs[0].bar(x + (j - .5) * w, r["P"], w, label=name)
+    axs[0].plot(x, Pmax, "k_", ms=14, label="Pmax"); axs[0].plot(x, Pmin, "r_", ms=14, label="Pmin")
+    axs[0].set_xticks(x); axs[0].set_xticklabels([f"P{i+1}" for i in x])
+    axs[0].set_ylabel("MW"); axs[0].set_title("Fig 2a. Optimal unit outputs (2000 MW)")
+    axs[0].legend(fontsize=8); axs[0].grid(alpha=.3, axis="y")
+
+    names = list(lit) + ["GWO (this code)"]
+    vals = list(lit.values()) + [gwo_nc]
+    bars = axs[1].bar(names, vals, color=["#9aa"] * len(lit) + ["#1f77b4"])
+    axs[1].set_ylim(min(vals) * 0.998, max(vals) * 1.001)
+    for bb, v in zip(bars, vals):
+        axs[1].text(bb.get_x() + bb.get_width() / 2, v, f"{v:,.0f}", ha="center", va="bottom", fontsize=8)
+    axs[1].set_ylabel("Fuel cost ($/h)")
+    axs[1].set_title("Fig 2b. Non-convex cost vs published (paper Table II)")
+    axs[1].grid(alpha=.3, axis="y")
+    fig.tight_layout(); fig.savefig("fig2_static_schedule_comparison.png", dpi=150)
+
+    # Fig 3 dynamic: demand/generation, cost per hour, heatmap, convergence
+    S, H, C, L = dyn["With valve point"]
+    S0, H0, C0, L0 = dyn["Without valve point"]
+    hrs = np.arange(1, 25)
+    fig, axs = plt.subplots(2, 2, figsize=(14, 9))
+    axs[0, 0].plot(hrs, DEMAND24, "o-", label="Demand")
+    axs[0, 0].plot(hrs, S.sum(1), "s--", label="Generation (with VP)")
+    axs[0, 0].fill_between(hrs, DEMAND24, S.sum(1), alpha=.25, color="orange", label="Losses")
+    axs[0, 0].set_title("Fig 3a. 24-h demand vs generation"); axs[0, 0].set_xlabel("Hour"); axs[0, 0].set_ylabel("MW")
+    axs[0, 0].legend(); axs[0, 0].grid(alpha=.3)
+
+    axs[0, 1].plot(hrs, C0, "o-", label="Without valve point")
+    axs[0, 1].plot(hrs, C, "s-", label="With valve point")
+    axs[0, 1].set_title("Fig 3b. Hourly fuel cost"); axs[0, 1].set_xlabel("Hour"); axs[0, 1].set_ylabel("$/h")
+    axs[0, 1].legend(); axs[0, 1].grid(alpha=.3)
+
+    im = axs[1, 0].imshow(S.T, aspect="auto", cmap="viridis",
+                          extent=[0.5, 24.5, N + .5, .5])
+    axs[1, 0].set_yticks(range(1, N + 1)); axs[1, 0].set_xlabel("Hour"); axs[1, 0].set_ylabel("Unit")
+    axs[1, 0].set_title("Fig 3c. Dispatch heat-map (MW, with VP)")
+    fig.colorbar(im, ax=axs[1, 0], label="MW")
+
+    axs[1, 1].stackplot(hrs, S.T, colors=colors, labels=[f"P{i+1}" for i in range(N)])
+    axs[1, 1].set_title("Fig 3d. Stacked generation by unit (with VP)")
+    axs[1, 1].set_xlabel("Hour"); axs[1, 1].set_ylabel("MW")
+    axs[1, 1].legend(ncol=5, fontsize=7, loc="upper left"); axs[1, 1].grid(alpha=.3)
+    fig.tight_layout(); fig.savefig("fig3_dynamic_dispatch.png", dpi=150)
+
+    # Fig 4 dynamic convergence (mean over intervals) + comparison with literature
+    fig, axs = plt.subplots(1, 2, figsize=(13, 4.8))
+    axs[0].plot(H0.mean(0), label="Without VP"); axs[0].plot(H.mean(0), label="With VP")
+    axs[0].set_title("Fig 4a. Mean convergence per interval (24-h case)")
+    axs[0].set_xlabel("Iteration"); axs[0].set_ylabel("Hourly fuel cost ($/h)")
+    axs[0].grid(alpha=.3); axs[0].legend()
+
+    # NOTE: the paper's 24-h system data is "customised" and not published, so a
+    # bar comparison with its Table IV would be misleading. Show energy per unit instead.
+    xx = np.arange(N); w = 0.38
+    axs[1].bar(xx - w/2, S0.sum(0), w, label="Without VP")
+    axs[1].bar(xx + w/2, S.sum(0), w, label="With VP")
+    axs[1].set_xticks(xx); axs[1].set_xticklabels([f"P{i+1}" for i in xx])
+    axs[1].set_ylabel("24-h energy (MWh)")
+    axs[1].set_title("Fig 4b. Energy supplied by each unit over 24 h")
+    axs[1].grid(alpha=.3, axis="y"); axs[1].legend(); fig.tight_layout()
+    fig.savefig("fig4_dynamic_convergence_comparison.png", dpi=150)
+
+    print("\nSaved: fig1_static_convergence.png, fig2_static_schedule_comparison.png,"
+          "\n       fig3_dynamic_dispatch.png, fig4_dynamic_convergence_comparison.png")
+    plt.show()   # opens all 4 figure windows
+
+
+if __name__ == "__main__":
+    main()
