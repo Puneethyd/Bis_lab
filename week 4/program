@@ -1,1 +1,152 @@
 
+import numpy as np
+import matplotlib.pyplot as plt
+import scipy.special as special
+
+# =====================================================================
+# 1. ENVIRONMENT & SIMULATION SETUP
+# =====================================================================
+START = np.array([0.0, 0.0])
+GOAL = np.array([10.0, 10.0])
+NUM_WAYPOINTS = 5  # Number of internal decision points for the robot path
+
+# Define static circular obstacles: [x, y, radius]
+OBSTACLES = np.array([
+    [3.0, 3.0, 1.5],
+    [5.0, 7.0, 1.8],
+    [7.0, 4.0, 1.4],
+    [2.0, 6.5, 1.2],
+    [7.5, 8.0, 1.0]
+])
+
+# =====================================================================
+# 2. FITNESS FUNCTION (Distance + Obstacle Penalties)
+# =====================================================================
+def reconstruct_path(waypoints):
+    """Combines START, internal waypoints, and GOAL into a single continuous path."""
+    points = waypoints.reshape((NUM_WAYPOINTS, 2))
+    return np.vstack([START, points, GOAL])
+
+def evaluate_fitness(waypoints):
+    """Calculates path fitness. Lower values = better path."""
+    path = reconstruct_path(waypoints)
+    
+    # 1. Total Euclidean Distance
+    distance = 0.0
+    for i in range(len(path) - 1):
+        distance += np.linalg.norm(path[i+1] - path[i])
+        
+    # 2. Obstacle Clearance / Avoidance Penalty
+    penalty = 0.0
+    # Check interpolation points along each segment for tight collision mapping
+    for i in range(len(path) - 1):
+        p1, p2 = path[i], path[i+1]
+        for t in np.linspace(0, 1, 10): 
+            check_pt = p1 + t * (p2 - p1)
+            for obs in OBSTACLES:
+                obs_center = obs[:2]
+                obs_radius = obs[2]
+                dist_to_obs = np.linalg.norm(check_pt - obs_center)
+                if dist_to_obs <= obs_radius:
+                    penalty += 500.0 * (obs_radius - dist_to_obs + 0.5) # Dynamic penalization
+
+    return distance + penalty
+
+# =====================================================================
+# 3. LÉVY FLIGHT GENERATION
+# =====================================================================
+def levy_flight(step_size=0.1, lambda_val=1.5, size=None):
+    """
+    Generates step lengths from a power-law distribution with a heavy tail 
+    using Mantegna's asymptotic algorithm.
+    """
+    sigma_u = (special.gamma(1 + lambda_val) * np.sin(np.pi * lambda_val / 2) / 
+               (special.gamma((1 + lambda_val) / 2) * lambda_val * (2**((lambda_val - 1) / 2))))**(1 / lambda_val)
+    
+    u = np.random.normal(0, sigma_u, size=size)
+    v = np.random.normal(0, 1, size=size)
+    
+    step = u / (np.abs(v)**(1 / lambda_val))
+    return step_size * step
+
+# =====================================================================
+# 4. CUCKOO SEARCH ALGORITHM
+# =====================================================================
+def cuckoo_search_path_planning(n_nests=25, max_gen=150, pa=0.25):
+    dim = NUM_WAYPOINTS * 2 # X and Y coordinates for each internal waypoint
+    
+    # Initialize host nests randomly within the boundary maps [0, 10]
+    nests = np.random.uniform(0.0, 10.0, size=(n_nests, dim))
+    fitness = np.array([evaluate_fitness(n) for n in nests])
+    
+    # Find current best initial solution
+    best_idx = np.argmin(fitness)
+    best_nest = nests[best_idx].copy()
+    best_fitness = fitness[best_idx]
+    
+    # Optimization Loop
+    for gen in range(max_gen):
+        # Step A: Get a random cuckoo via Lévy Flight from a random existing nest
+        i = np.random.randint(0, n_nests)
+        step = levy_flight(step_size=0.2, lambda_val=1.5, size=dim)
+        
+        new_cuckoo = nests[i] + step * (nests[i] - best_nest)
+        new_cuckoo = np.clip(new_cuckoo, 0.0, 10.0) # Boundary control
+        new_fitness = evaluate_fitness(new_cuckoo)
+        
+        # Step B: Replace a random nest j if the new cuckoo is better
+        j = np.random.randint(0, n_nests)
+        if new_fitness < fitness[j]:
+            nests[j] = new_cuckoo
+            fitness[j] = new_fitness
+            
+        # Step C: Abandon a fraction (pa) of the worst nests
+        # (Simulating discovery of parasite eggs by host birds)
+        sorted_indices = np.argsort(fitness)
+        cutoff = int((1 - pa) * n_nests)
+        
+        # Replace abandoned nests with random steps relative to current layout
+        for idx in sorted_indices[cutoff:]:
+            r1, r2 = np.random.randint(0, n_nests, size=2)
+            nests[idx] = nests[idx] + np.random.rand() * (nests[r1] - nests[r2])
+            nests[idx] = np.clip(nests[idx], 0.0, 10.0)
+            fitness[idx] = evaluate_fitness(nests[idx])
+            
+        # Update global target tracking
+        current_best_idx = np.argmin(fitness)
+        if fitness[current_best_idx] < best_fitness:
+            best_fitness = fitness[current_best_idx]
+            best_nest = nests[current_best_idx].copy()
+
+    return reconstruct_path(best_nest), best_fitness
+
+# =====================================================================
+# 5. EXECUTION & VISUALIZATION
+# =====================================================================
+print("Running Cuckoo Search Path Planning optimization loop...")
+optimal_path, optimal_score = cuckoo_search_path_planning(n_nests=30, max_gen=200, pa=0.25)
+print(f"Optimization finished! Final Path Fitness Metric: {optimal_score:.4f}")
+
+# Plotting the environment
+fig, ax = plt.subplots(figsize=(8, 8))
+
+# Draw Obstacles
+for obs in OBSTACLES:
+    circle = plt.Circle((obs[0], obs[1]), obs[2], color='darkred', alpha=0.6, label='Obstacle' if 'Obstacle' not in ax.get_legend_handles_labels()[1] else "")
+    ax.add_patch(circle)
+
+# Draw Path, Waypoints, Start & Goal points
+ax.plot(optimal_path[:, 0], optimal_path[:, 1], color='#1f77b4', linestyle='-', linewidth=3, marker='o', markersize=6, label='Optimized Robot Path')
+ax.scatter(START[0], START[1], color='green', s=150, zorder=5, label='Start Node')
+ax.scatter(GOAL[0], GOAL[1], color='gold', edgecolor='black', s=150, zorder=5, label='Goal Node')
+
+# Graph limits & labels
+ax.set_xlim(-0.5, 10.5)
+ax.set_ylim(-0.5, 10.5)
+ax.set_title("Mobile Robot Path Planning in Cluttered Space\n(Cuckoo Search via Lévy Flights)", fontsize=12, fontweight='bold')
+ax.set_xlabel("X-Coordinate Grid")
+ax.set_ylabel("Y-Coordinate Grid")
+ax.grid(True, linestyle='--', alpha=0.5)
+ax.legend(loc='upper left')
+
+plt.show()
