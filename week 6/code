@@ -1,0 +1,276 @@
+
+"""
+Parallel Cellular Automata Traffic Simulation (Nagel-Schreckenberg model)
+=========================================================================
+Runs as-is in Google Colab (only NumPy + Matplotlib needed).
+
+What it does
+------------
+1. Reference sequential NaSch simulator (independent implementation).
+2. Parallel simulator: ring road split into P sub-domains, halo exchange of
+   width v_max, vehicle migration between sub-domains, thread-parallel update.
+3. Validation: parallel result must be IDENTICAL to the sequential result.
+4. Plots: space-time diagram, fundamental diagram, speed-up and efficiency.
+
+Counter-based random numbers (keyed by time step + global cell) make the
+result independent of the number of sub-domains.
+"""
+
+import os
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+from concurrent.futures import ThreadPoolExecutor
+
+# ----------------------------------------------------------------------------
+# Model parameters
+# ----------------------------------------------------------------------------
+V_MAX = 5          # maximum speed (cells / step)
+P_SLOW = 0.25      # random slowdown probability
+SEED = 12345
+
+
+# ----------------------------------------------------------------------------
+# Counter-based random numbers (SplitMix64 hash) -> uniform [0, 1)
+# ----------------------------------------------------------------------------
+def uniform_hash(key, seed=SEED):
+    with np.errstate(over="ignore"):
+        z = key.astype(np.uint64) + np.uint64(seed)
+        z = z * np.uint64(0x9E3779B97F4A7C15)
+        z ^= z >> np.uint64(30)
+        z = z * np.uint64(0xBF58476D1CE4E5B9)
+        z ^= z >> np.uint64(27)
+        z = z * np.uint64(0x94D049BB133111EB)
+        z ^= z >> np.uint64(31)
+    return (z >> np.uint64(11)).astype(np.float64) / float(2 ** 53)
+
+
+def init_road(L, density, seed=SEED):
+    """Cell array: -1 = empty, otherwise vehicle speed."""
+    rng = np.random.default_rng(seed)
+    n_cars = int(round(density * L))
+    cells = rng.choice(L, n_cars, replace=False)
+    road = -np.ones(L, dtype=np.int8)
+    road[cells] = 0
+    return road
+
+
+# ----------------------------------------------------------------------------
+# 1) Sequential reference implementation (ring road, car-list based)
+# ----------------------------------------------------------------------------
+def run_sequential(road0, steps, vmax=V_MAX, p=P_SLOW):
+    L = len(road0)
+    pos = np.flatnonzero(road0 >= 0).astype(np.int64)   # cyclic order is kept
+    vel = road0[pos].astype(np.int64)
+    for t in range(steps):
+        gap = (np.roll(pos, -1) - pos - 1) % L          # empty cells ahead
+        vel = np.minimum(vel + 1, vmax)                  # 1. acceleration
+        vel = np.minimum(vel, gap)                       # 2. braking
+        r = uniform_hash(t * L + pos)                    # 3. randomisation
+        vel = np.where((r < p) & (vel > 0), vel - 1, vel)
+        pos = (pos + vel) % L                            # 4. movement
+    out = -np.ones(L, dtype=np.int8)
+    out[pos] = vel
+    return out
+
+
+# ----------------------------------------------------------------------------
+# 2) Parallel implementation: domain decomposition + halo exchange
+# ----------------------------------------------------------------------------
+def local_update(args):
+    """Update the vehicles owned by ONE sub-domain.
+
+    Uses own cells + right halo (v_max cells of the next sub-domain).
+    Returns an array of length n + v_max; the last v_max entries are
+    vehicles that crossed into the right neighbour (to be migrated).
+    """
+    local, halo, offset, t, L, vmax, p = args
+    n = len(local)
+    ext_occ = np.concatenate((local, halo)) >= 0
+
+    idx = np.flatnonzero(local >= 0)                      # owned vehicles
+    out = -np.ones(n + vmax, dtype=np.int8)
+    if idx.size == 0:
+        return out
+
+    gap = np.zeros(idx.size, dtype=np.int64)              # gap, capped at vmax
+    alive = np.ones(idx.size, dtype=bool)
+    for k in range(1, vmax + 1):
+        alive &= ~ext_occ[idx + k]
+        gap += alive
+
+    vel = np.minimum(local[idx].astype(np.int64) + 1, vmax)   # acceleration
+    vel = np.minimum(vel, gap)                                 # braking
+    r = uniform_hash(t * L + offset + idx)                     # randomisation
+    vel = np.where((r < p) & (vel > 0), vel - 1, vel)
+    out[idx + vel] = vel                                       # movement
+    return out
+
+
+def run_parallel(road0, steps, P, vmax=V_MAX, p=P_SLOW, pool=None,
+                 record=False, measure_from=None):
+    """Parallel NaSch on P sub-domains.
+
+    record       : store full road state each step (for space-time plots)
+    measure_from : if set, average vehicle speed from this step on
+    """
+    L = len(road0)
+    bounds = np.linspace(0, L, P + 1).astype(int)
+    sizes = np.diff(bounds)
+    assert sizes.min() >= vmax, "sub-domains must be at least v_max cells wide"
+    subs = [road0[bounds[i]:bounds[i + 1]].copy() for i in range(P)]
+    history, speed_sum, speed_cnt = [], 0.0, 0
+
+    for t in range(steps):
+        if record:
+            history.append(np.concatenate(subs))
+        # --- halo exchange: each domain receives first v_max cells of right neighbour
+        tasks = [(subs[i], subs[(i + 1) % P][:vmax].copy(), bounds[i],
+                  t, L, vmax, p) for i in range(P)]
+        # --- parallel local update of all sub-domains
+        if pool is None or P == 1:
+            outs = [local_update(a) for a in tasks]
+        else:
+            outs = list(pool.map(local_update, tasks))
+        # --- vehicle migration: overflow of left neighbour enters first cells
+        new_subs = []
+        for i in range(P):
+            nv = outs[i][:sizes[i]].copy()
+            nv[:vmax] = np.maximum(nv[:vmax], outs[(i - 1) % P][sizes[i - 1]:])
+            new_subs.append(nv)
+        subs = new_subs
+
+        if measure_from is not None and t >= measure_from:
+            cars = np.concatenate([s[s >= 0] for s in subs])
+            if cars.size:
+                speed_sum += cars.mean()
+                speed_cnt += 1
+
+    final = np.concatenate(subs)
+    if record:
+        history.append(final)
+        return final, np.array(history)
+    if measure_from is not None:
+        return final, (speed_sum / max(speed_cnt, 1))
+    return final
+
+
+# ----------------------------------------------------------------------------
+# 3) Validation: parallel == sequential
+# ----------------------------------------------------------------------------
+def validate():
+    print("=== Validation: parallel result vs. sequential reference ===")
+    L, density, steps = 5000, 0.15, 300
+    road0 = init_road(L, density)
+    ref = run_sequential(road0, steps)
+    ok_all = True
+    for P in (1, 2, 4, 7):
+        with ThreadPoolExecutor(max_workers=P) as pool:
+            res = run_parallel(road0, steps, P, pool=pool)
+        ok = np.array_equal(ref, res)
+        ok_all &= ok
+        print(f"  P = {P}:  identical to sequential -> {'PASS' if ok else 'FAIL'}")
+    print("  Overall:", "ALL TESTS PASSED\n" if ok_all else "MISMATCH FOUND\n")
+
+
+# ----------------------------------------------------------------------------
+# 4) Experiments
+# ----------------------------------------------------------------------------
+def space_time(L=400, density=0.20, steps=250, P=4):
+    road0 = init_road(L, density, seed=7)
+    _, hist = run_parallel(road0, steps, P, record=True)
+    return hist, np.linspace(0, L, P + 1)[1:-1]
+
+
+def fundamental_diagram(L=10000, P=4, steps=1000, warmup=400):
+    densities = np.linspace(0.02, 0.90, 30)
+    flows = []
+    with ThreadPoolExecutor(max_workers=P) as pool:
+        for d in densities:
+            road0 = init_road(L, d, seed=1)
+            _, mean_v = run_parallel(road0, steps, P, pool=pool,
+                                     measure_from=warmup)
+            flows.append(d * mean_v)            # flow = density * mean speed
+    return densities, np.array(flows)
+
+
+def scaling(L=2_000_000, density=0.10, steps=40, workers=(1, 2, 4, 8)):
+    road0 = init_road(L, density)
+    times = []
+    for P in workers:
+        with ThreadPoolExecutor(max_workers=P) as pool:
+            run_parallel(road0, 2, P, pool=pool)               # warm-up
+            t0 = time.perf_counter()
+            run_parallel(road0, steps, P, pool=pool)
+            times.append(time.perf_counter() - t0)
+        print(f"  P = {P:2d}   time = {times[-1]:7.2f} s")
+    times = np.array(times)
+    speedup = times[0] / times
+    efficiency = speedup / np.array(workers)
+    return np.array(workers), times, speedup, efficiency
+
+
+# ----------------------------------------------------------------------------
+# Main
+# ----------------------------------------------------------------------------
+if __name__ == "__main__" or True:        # `or True` lets it run in a Colab cell
+    print(f"CPU cores available: {os.cpu_count()}\n")
+    validate()
+
+    print("Running space-time simulation ...")
+    hist, borders = space_time()
+
+    print("Running fundamental diagram (30 densities) ...")
+    dens, flow = fundamental_diagram()
+
+    print("Running scaling benchmark (2 million cells) ...")
+    workers, times, speedup, eff = scaling()
+
+    fig, ax = plt.subplots(2, 2, figsize=(13, 10))
+
+    # (a) space-time diagram
+    masked = np.ma.masked_less(hist, 0)
+    im = ax[0, 0].imshow(masked, aspect="auto", cmap="RdYlGn",
+                         vmin=0, vmax=V_MAX, interpolation="nearest")
+    for b in borders:
+        ax[0, 0].axvline(b - 0.5, color="k", ls="--", lw=0.8)
+    ax[0, 0].set_title("(a) Space-time diagram (dashed = sub-domain borders)")
+    ax[0, 0].set_xlabel("Cell position")
+    ax[0, 0].set_ylabel("Time step")
+    plt.colorbar(im, ax=ax[0, 0], label="Vehicle speed (cells/step)")
+
+    # (b) fundamental diagram
+    ax[0, 1].plot(dens, flow, "o-", color="tab:blue")
+    ax[0, 1].set_title(f"(b) Fundamental diagram (v_max={V_MAX}, p={P_SLOW})")
+    ax[0, 1].set_xlabel("Density (vehicles / cell)")
+    ax[0, 1].set_ylabel("Flow (vehicles / step)")
+    ax[0, 1].grid(alpha=0.3)
+
+    # (c) speed-up
+    ax[1, 0].plot(workers, speedup, "s-", label="Measured", color="tab:red")
+    ax[1, 0].plot(workers, workers, "k--", label="Ideal")
+    ax[1, 0].set_title("(c) Speed-up (strong scaling)")
+    ax[1, 0].set_xlabel("Number of workers P")
+    ax[1, 0].set_ylabel("Speed-up S(P)")
+    ax[1, 0].legend()
+    ax[1, 0].grid(alpha=0.3)
+
+    # (d) efficiency
+    ax[1, 1].plot(workers, eff, "d-", color="tab:purple")
+    ax[1, 1].axhline(1.0, color="k", ls="--")
+    ax[1, 1].set_ylim(0, 1.2)
+    ax[1, 1].set_title("(d) Parallel efficiency E(P) = S(P) / P")
+    ax[1, 1].set_xlabel("Number of workers P")
+    ax[1, 1].set_ylabel("Efficiency")
+    ax[1, 1].grid(alpha=0.3)
+
+    plt.suptitle("Parallel Cellular Automata Traffic Simulation", fontsize=15)
+    plt.tight_layout()
+    plt.savefig("parallel_ca_traffic_results.png", dpi=150)
+    plt.show()
+
+    print("\nSummary table")
+    print(" P   Time(s)   Speed-up   Efficiency")
+    for P, T, S, E in zip(workers, times, speedup, eff):
+        print(f"{P:2d}   {T:7.2f}   {S:8.2f}   {E:10.2f}")
+    print("\nFigure saved as parallel_ca_traffic_results.png")
